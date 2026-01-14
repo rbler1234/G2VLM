@@ -28,6 +28,47 @@ import torchvision
 import open3d as o3d  # Optional but recommended for .ply saving (install with `pip install open3d`)
 import torch.nn.functional as F
 
+
+def load_model_and_tokenizer_from_path(model_path):
+    llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_path, "text_config.json"))
+
+    llm_config.qk_norm = True
+    llm_config.tie_word_embeddings = False
+    llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'  
+
+    vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
+    vit_config.patch_size =14
+
+    dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(model_path, "dino_config.json"))
+
+    config = G2VLMConfig(
+        visual_und=True,
+        visual_recon=True,
+        llm_config=llm_config, 
+        vit_config=vit_config,
+        dino_config=dino_config,
+        vit_max_num_patch_per_side=36,
+    )
+    language_model = Qwen2VLForCausalLM(llm_config)
+    vit_model      = Qwen2VisionTransformerPretrainedModel(vit_config)
+    dino_model = Dinov2WithRegistersModel(dino_config)
+
+    model = G2VLM(language_model, vit_model, dino_model, config)
+
+    tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
+    tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+
+    vit_image_transform = QwenVL2ImageTransform(768, 768, 14)
+    dino_transform = DinoImageNormalizeTransform(target_size=518)
+
+    model_state_dict_path = os.path.join(model_path, "model.safetensors")
+    model_state_dict = load_file(model_state_dict_path, device="cpu")
+    msg = model.load_state_dict(model_state_dict, strict=False)
+    print(msg)
+    del model_state_dict
+    model = model.cuda().eval()
+
+    return model, tokenizer, new_token_ids , vit_image_transform, dino_transform
 def load_model_and_tokenizer(args):
     llm_config = Qwen2VLConfig.from_json_file(os.path.join(args.model_path, "text_config.json"))
 
@@ -100,7 +141,7 @@ def save_ply_visualization(
         images, nrow=8, normalize=False, scale_each=False
     )
     images_grid = images_grid
-    images_save_path = f'results/input_images.png'
+    images_save_path = f'input_images.png'
     torchvision.utils.save_image(
         images_grid, images_save_path, normalize=False, scale_each=False
     )

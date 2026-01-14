@@ -22,14 +22,14 @@ from data.data_utils import (
 from .qwen2vl import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding, PositionEmbedding_Extra
 
-from pi3.models.layers.transformer_head import Pi3TransformerDecoder, Pi3LinearPts3d, Pi3ContextTransformerDecoder
-from pi3.models.layers.camera_head import Pi3CameraHead
-from pi3.models.layers.pos_embed import RoPE2D, PositionGetter
-from pi3.utils.geometry import homogenize_points
+from modeling.pi3.models.layers.transformer_head import Pi3TransformerDecoder, Pi3LinearPts3d, Pi3ContextTransformerDecoder
+from modeling.pi3.models.layers.camera_head import Pi3CameraHead
+from modeling.pi3.models.layers.pos_embed import RoPE2D, PositionGetter
+from modeling.pi3.utils.geometry import homogenize_points
 from copy import deepcopy
 from easydict import EasyDict
 
-from pi3.models.pi3_loss import Pi3Loss
+from modeling.pi3.models.pi3_loss import Pi3Loss
 from data.transforms_vggt import load_and_preprocess_images, load_and_resize14
 from tqdm import tqdm
 import random
@@ -964,6 +964,103 @@ class G2VLM(PreTrainedModel):
         }
     
         return generation_input, newlens, new_rope
+    def prepare_dino_images_none (self, curr_kvlens, curr_rope, images, transforms, new_token_ids):
+        packed_dino_token_indexes = list()
+        dino_token_seqlens, packed_dino_tokens, packed_dino_position_ids = list(), list(), list()
+        packed_text_ids, packed_text_indexes = list(), list()
+        packed_seqlens, packed_position_ids, packed_indexes = list(), list(), list()
+        packed_key_value_indexes = list()
+
+        _curr = curr = 0
+        newlens, new_rope = list(), list()
+    
+        vggt_fixed_resolution = 518 # hardcode 
+        img_load_resolution = 1024
+
+        curr_kvlen = curr_kvlens[0]
+        curr_position_id = curr_rope[0]
+        
+        packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+        curr += curr_kvlen
+        for image in images:
+            
+            packed_text_ids.append(new_token_ids['start_of_image'])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            image_tensor = image
+            height, width = image_tensor.shape[1:]
+            grid_t = 1  
+            grid_h, grid_w = height // 14, width // 14
+
+            # add 3d pos for <|startofimage|> token
+            pos_tensor = torch.full((1,), curr_position_id, dtype=torch.long)
+            packed_position_ids.extend([pos_tensor.expand(3, 1)])
+            curr_position_id += 1
+
+            dino_tokens = patchify(image_tensor, self.dino_patch_size)
+            packed_dino_tokens.append(dino_tokens)
+            num_img_tokens = dino_tokens.shape[0]
+            dino_token_seqlens.append(num_img_tokens)
+  
+            packed_dino_token_indexes.extend(range(_curr, _curr + num_img_tokens))
+            packed_indexes.extend(range(curr, curr + num_img_tokens))
+            curr += num_img_tokens
+            _curr += num_img_tokens
+
+            ###3d rope embedding for QKV attention: 
+            dino_image_thw = torch.tensor([grid_t, grid_h, grid_w], dtype=torch.long) 
+            postions_ids_from_dino_for_rope, rope_deltas = get_rope_index_image_3D_dino(
+                dino_image_thw,
+                curr_position_id,
+                device=image_tensor.device
+            )
+            packed_position_ids.extend([postions_ids_from_dino_for_rope])
+            curr_position_id += rope_deltas + 1
+
+            packed_text_ids.append(new_token_ids['end_of_image'])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            pos_tensor = torch.full((1,), curr_position_id, dtype=torch.long)
+            packed_position_ids.extend([pos_tensor.expand(3, 1)])
+            curr_position_id += 1
+
+            packed_seqlens.append(num_img_tokens + 2)
+            newlens.append(curr_kvlen + num_img_tokens + 2)
+            curr_kvlen += num_img_tokens + 2
+
+            new_rope.append(curr_position_id)
+
+        newlens = [newlens[-1]]
+        new_rope = [new_rope[-1]]
+        packed_seqlens = [sum(packed_seqlens)]
+
+
+        assert len(images.shape) == 4
+        assert images.shape[1] == 3
+        original_images = images.clone()
+        images = torchvision.transforms.Normalize(mean=_RESNET_MEAN, std=_RESNET_STD)(images) 
+
+        generation_input = {
+            "packed_dino_images": images, 
+            'original_images': original_images,
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "dino_token_seqlens": torch.tensor(dino_token_seqlens, dtype=torch.int),
+            "packed_dino_token_indexes": torch.tensor(packed_dino_token_indexes, dtype=torch.long),
+            "packed_position_ids": torch.cat(packed_position_ids, dim=1),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+    
+        return generation_input, newlens, new_rope
 
     @torch.no_grad
     def forward_cache_update_dino(
@@ -1297,6 +1394,81 @@ class G2VLM(PreTrainedModel):
             predictions_dict = self.reconstruct(
                 past_key_values=past_key_values,
                 selected_hidden_states=last_hidden_state,
+                **generation_input,
+            )
+
+        return predictions_dict
+    @torch.no_grad()
+    def recon_for_eval(
+        self,
+        tokenizer,
+        new_token_ids,
+        dino_image_transform,
+        images, #this now expect image paths 
+        prompt,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+    ):
+        device = next(self.parameters()).device
+
+        if isinstance(new_token_ids, dict):
+            for k, v in new_token_ids.items():
+                if torch.is_tensor(v):
+                    new_token_ids[k] = v.to(device)
+        elif torch.is_tensor(new_token_ids):
+            new_token_ids = new_token_ids.to(device)
+
+        # prefill
+        past_key_values = NaiveCache(self.config.llm_config.num_hidden_layers)
+        newlens = [0]
+        new_rope = [0]
+
+        #add text system prompt hard code: 
+        # system_prompt = 'system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\n'
+        system_prompt = 'Reconstruct the 3D scene.'
+        ### todo check what is this template, does it needs bos eos .... 
+
+        print('Prepareing prompt')
+        generation_input, newlens, new_rope = self.prepare_prompts_addbos(
+            curr_kvlens=newlens,
+            curr_rope=new_rope, 
+            prompts=[system_prompt],
+            tokenizer=tokenizer, 
+            new_token_ids=new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(device)
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            past_key_values = self.forward_cache_update_text(past_key_values, **generation_input)
+
+        # add images
+        # for image in images:
+        print('Prepareing dino images ')
+
+        generation_input, newlens, new_rope = self.prepare_dino_images_none(
+            curr_kvlens=newlens,
+            curr_rope=new_rope, 
+            images=images, 
+            transforms=dino_image_transform,
+            new_token_ids=new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(device)
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            past_key_values, last_hidden_state = self.forward_cache_update_dino(past_key_values, **generation_input)
+
+        # recon 
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            predictions_dict = self.reconstruct(
+                past_key_values=past_key_values,
+                max_length=max_length,
+                selected_hidden_states=last_hidden_state,
+                # do_sample=do_sample,
+                # temperature=temperature,
+                # end_token_id=new_token_ids['eos_token_id'],
                 **generation_input,
             )
 

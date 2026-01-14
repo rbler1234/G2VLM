@@ -20,8 +20,24 @@ from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_l
 from modeling.dinov2_with_registers.configuration_dinov2_with_registers import Dinov2WithRegistersConfig 
 from modeling.dinov2_with_registers.modeling_dinov2_with_registers import Dinov2WithRegistersSelfAttention, Dinov2WithRegistersPreTrainedModel, Dinov2WithRegistersEmbeddings, Dinov2WithRegistersPatchEmbeddings
 from flash_attn import flash_attn_varlen_func
-
-
+def check_inf_nan_debug(input_tensor, loss_name="default", hard_max=100):
+    """
+    Checks if 'input_tensor' contains inf or nan values and clamps extreme values.
+    
+    Args:
+        input_tensor (torch.Tensor): The loss tensor to check and fix.
+        loss_name (str): Name of the loss (for diagnostic prints).
+        hard_max (float, optional): Maximum absolute value allowed. Values outside 
+                                  [-hard_max, hard_max] will be clamped. If None, 
+                                  no clamping is performed. Defaults to 100.
+    """
+    if input_tensor is None:
+        return input_tensor
+    
+    # Check for inf/nan values
+    has_inf_nan = torch.isnan(input_tensor).any() or torch.isinf(input_tensor).any()
+    if has_inf_nan:
+        print(f"Tensor {loss_name} contains inf or nan values. {input_tensor}")
 
 class Dinov2WithRegistersSelfAttention2(Dinov2WithRegistersSelfAttention):
     def __init__(self, *args, **kwargs):
@@ -35,27 +51,35 @@ class Dinov2WithRegistersSelfAttention2(Dinov2WithRegistersSelfAttention):
         **kwargs,
     ) -> torch.Tensor:
         # print('total_q_len, hidden_states', hidden_states.size())
-
+        
+        
+        check_inf_nan_debug(hidden_states, 'hidden_states_input')
+    
         total_q_len, _ = hidden_states.size()
-
+        
         query_states = self.query(hidden_states)
-        key_states = self.key(hidden_states)
+        key_states = self.key(hidden_states) 
         value_states = self.value(hidden_states)
 
+        check_inf_nan_debug(query_states, 'query_states')
+        check_inf_nan_debug(key_states, 'key_states')
+        check_inf_nan_debug(value_states, 'value_states')
+        
         query_states = query_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
         key_states = key_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
         value_states = value_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
-
-        context_layer = flash_attn_varlen_func(
-            query_states.to(torch.bfloat16),
-            key_states.to(torch.bfloat16),
-            value_states.to(torch.bfloat16),
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=False,
-        )
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            context_layer = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+            )
+        check_inf_nan_debug(context_layer,'context_layer')
         # new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         outputs = context_layer.reshape(total_q_len, -1)
         return outputs
