@@ -1,3 +1,6 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 from typing import List, Tuple, Optional
 from typing import Any, Dict, List, Mapping, Optional, Sequence 
@@ -22,14 +25,14 @@ from data.data_utils import (
 from .qwen2vl import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding, PositionEmbedding_Extra
 
-from modeling.pi3.models.layers.transformer_head import Pi3TransformerDecoder, Pi3LinearPts3d, Pi3ContextTransformerDecoder
-from modeling.pi3.models.layers.camera_head import Pi3CameraHead
-from modeling.pi3.models.layers.pos_embed import RoPE2D, PositionGetter
-from modeling.pi3.utils.geometry import homogenize_points
+from pi3.models.layers.transformer_head import Pi3TransformerDecoder, Pi3LinearPts3d, Pi3ContextTransformerDecoder
+from pi3.models.layers.camera_head import Pi3CameraHead
+from pi3.models.layers.pos_embed import RoPE2D, PositionGetter
+from pi3.utils.geometry import homogenize_points
 from copy import deepcopy
 from easydict import EasyDict
 
-from modeling.pi3.models.pi3_loss import Pi3Loss
+from pi3.models.pi3_loss import Pi3Loss
 from data.transforms_vggt import load_and_preprocess_images, load_and_resize14
 from tqdm import tqdm
 import random
@@ -963,7 +966,118 @@ class G2VLM(PreTrainedModel):
             "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
         }
     
+
         return generation_input, newlens, new_rope
+    def prepare_dino_images_vggt (self, curr_kvlens, curr_rope, images, transforms, new_token_ids):
+        packed_dino_token_indexes = list()
+        dino_token_seqlens, packed_dino_tokens, packed_dino_position_ids = list(), list(), list()
+        packed_text_ids, packed_text_indexes = list(), list()
+        packed_seqlens, packed_position_ids, packed_indexes = list(), list(), list()
+        packed_key_value_indexes = list()
+
+        _curr = curr = 0
+        newlens, new_rope = list(), list()
+         
+        vggt_fixed_resolution = 518  
+        img_load_resolution = 1024
+    
+        images = load_and_preprocess_images(images,  mode="crop")
+        images = F.interpolate(images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False)
+        
+        curr_kvlen = curr_kvlens[0]
+        curr_position_id = curr_rope[0]
+        
+        packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+        curr += curr_kvlen
+        for image in images:
+           
+            packed_text_ids.append(new_token_ids['start_of_image'])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            image_tensor = image
+            height, width = image_tensor.shape[1:]
+            grid_t = 1  #patches.shape[0] // self.temporal_patch_size
+            if self.use_dinov3:
+                grid_h, grid_w = height // 16, width // 16
+            else:
+                grid_h, grid_w = height // 14, width // 14
+
+            # add 3d pos for <|startofimage|> token
+            pos_tensor = torch.full((1,), curr_position_id, dtype=torch.long)
+            packed_position_ids.extend([pos_tensor.expand(3, 1)])
+            curr_position_id += 1
+
+
+            dino_tokens = patchify(image_tensor, self.dino_patch_size)
+            packed_dino_tokens.append(dino_tokens)
+            num_img_tokens = dino_tokens.shape[0]
+            dino_token_seqlens.append(num_img_tokens)
+
+            packed_dino_token_indexes.extend(range(_curr, _curr + num_img_tokens))
+            packed_indexes.extend(range(curr, curr + num_img_tokens))
+            curr += num_img_tokens
+            _curr += num_img_tokens
+
+            ###3d rope embedding for QKV attention: 
+            dino_image_thw = torch.tensor([grid_t, grid_h, grid_w], dtype=torch.long) # Shape: (3
+            postions_ids_from_dino_for_rope, rope_deltas = get_rope_index_image_3D_dino(
+                dino_image_thw,
+                curr_position_id,
+                device=image_tensor.device
+            )
+            packed_position_ids.extend([postions_ids_from_dino_for_rope])
+            curr_position_id += rope_deltas + 1
+
+            packed_text_ids.append(new_token_ids['end_of_image'])
+            packed_text_indexes.append(_curr)
+            packed_indexes.append(curr)
+            curr += 1
+            _curr += 1
+
+            pos_tensor = torch.full((1,), curr_position_id, dtype=torch.long)
+            packed_position_ids.extend([pos_tensor.expand(3, 1)])
+            curr_position_id += 1
+
+            packed_seqlens.append(num_img_tokens + 2)
+            #edit 
+            newlens.append(curr_kvlen + num_img_tokens + 2)
+            curr_kvlen += num_img_tokens + 2
+
+
+            new_rope.append(curr_position_id)
+            # curr_position_id += 1
+
+        newlens = [newlens[-1]]
+        new_rope = [new_rope[-1]]
+        packed_seqlens = [sum(packed_seqlens)]
+        dino_token_seqlens = [sum(dino_token_seqlens)]
+
+        assert len(images.shape) == 4
+        assert images.shape[1] == 3
+
+        original_images = images.clone()
+        images = torchvision.transforms.Normalize(mean=_RESNET_MEAN, std=_RESNET_STD)(images) 
+
+        generation_input = {
+            "packed_dino_images": images, 
+            'original_images': original_images,
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "dino_token_seqlens": torch.tensor(dino_token_seqlens, dtype=torch.int),
+            "packed_dino_token_indexes": torch.tensor(packed_dino_token_indexes, dtype=torch.long),
+            "packed_position_ids": torch.cat(packed_position_ids, dim=1),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+
+        return generation_input, newlens, new_rope
+
+
     def prepare_dino_images_none (self, curr_kvlens, curr_rope, images, transforms, new_token_ids):
         packed_dino_token_indexes = list()
         dino_token_seqlens, packed_dino_tokens, packed_dino_position_ids = list(), list(), list()
@@ -973,9 +1087,6 @@ class G2VLM(PreTrainedModel):
 
         _curr = curr = 0
         newlens, new_rope = list(), list()
-    
-        vggt_fixed_resolution = 518 # hardcode 
-        img_load_resolution = 1024
 
         curr_kvlen = curr_kvlens[0]
         curr_position_id = curr_rope[0]
@@ -1060,8 +1171,8 @@ class G2VLM(PreTrainedModel):
             "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
         }
     
-        return generation_input, newlens, new_rope
 
+        return generation_input, newlens, new_rope
     @torch.no_grad
     def forward_cache_update_dino(
         self,
@@ -1334,6 +1445,9 @@ class G2VLM(PreTrainedModel):
     
         return pi3_pred
   
+
+
+ # for evaluation
     @torch.no_grad()
     def recon(
         self,
@@ -1473,7 +1587,6 @@ class G2VLM(PreTrainedModel):
             )
 
         return predictions_dict
-
     @torch.no_grad()
     def chat_with_recon(
         self,
